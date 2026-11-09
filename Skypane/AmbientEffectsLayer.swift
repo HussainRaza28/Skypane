@@ -7,7 +7,7 @@ import AppKit
 import SpriteKit
 
 /// Decorative effects over the desktop: leaves, petals, confetti, fireflies, embers, bubbles,
-/// stars, dust, shooting stars, and auroras. Each kind has its own fixed pool of sprites, built once,
+/// stars, dust, shooting stars, and auroras. Each active kind has a reusable pool of sprites
 /// that fades in and out as scenes change. Any mix of kinds can show at once.
 final class AmbientEffectsLayer {
     /// Simulation state for one sprite. The meaning of the phases depends on the kind
@@ -59,8 +59,8 @@ final class AmbientEffectsLayer {
     private var pools: [KindPool] = []
     private var sceneSize: CGSize = .zero
 
-    init() {
-        for kind in AmbientKind.allCases {
+    private func preparePools(for layers: [AmbientLayer]) {
+        for kind in AmbientKind.allCases where layers.contains(where: { $0.kind == kind }) && !pools.contains(where: { $0.kind == kind }) {
             let pool = KindPool(kind: kind, capacity: Self.capacity(of: kind))
             pool.containerNode.isHidden = true
             pool.containerNode.alpha = 0
@@ -87,6 +87,7 @@ final class AmbientEffectsLayer {
 
     /// Shows the given effects and fades out any others.
     func apply(_ layers: [AmbientLayer]) {
+        preparePools(for: layers)
         for pool in pools {
             guard let layer = layers.first(where: { $0.kind == pool.kind }) else {
                 pool.targetCount = 0
@@ -117,6 +118,12 @@ final class AmbientEffectsLayer {
     // MARK: - Per-frame update
 
     func update(deltaTime: CGFloat, windDrift: CGFloat) {
+        // Retire pools only after their existing fade has finished.
+        pools.removeAll { pool in
+            guard pool.targetCount == 0, pool.visibility < 0.01 else { return false }
+            pool.containerNode.removeFromParent()
+            return true
+        }
         for pool in pools {
             let targetVisibility: CGFloat = pool.targetCount > 0 ? 1 : 0
             pool.visibility += (targetVisibility - pool.visibility) * min(1, fadeRate * deltaTime)

@@ -38,9 +38,18 @@ final class SnowPile {
     let fillNode = SKShapeNode()
     let shadowNode = SKShapeNode()
 
-    /// Whether any snow is resting on this pile.
-    var hasSnow: Bool {
-        heights.contains { $0 > Self.bareHeight }
+    /// Whether any snow is resting on this pile. Kept up to date as snow lands, falls, and melts,
+    /// so checking it every frame is cheap.
+    private(set) var hasSnow = false
+
+    /// Whether a point is close to this pile's snow (within `margin` points), for waking the
+    /// layer before the cursor reaches it.
+    func isNear(_ point: CGPoint, margin: CGFloat) -> Bool {
+        guard hasSnow, let columnSpan else { return false }
+        return point.x >= columnSpan.lowerBound - margin
+            && point.x <= columnSpan.upperBound + margin
+            && point.y >= edgeY - margin
+            && point.y <= edgeY + Self.maximumHeight + margin
     }
 
     /// The window's top edge, where the pile rests.
@@ -86,6 +95,7 @@ final class SnowPile {
         visibleColumns.removeAll(keepingCapacity: true)
         visibleColumns.append(contentsOf: repeatElement(false, count: columnCount))
         needsRedraw = true
+        hasSnow = false
     }
 
     /// Follows the window to a new frame. If it was resized and its top edge stayed put, snow on the
@@ -145,6 +155,8 @@ final class SnowPile {
 
     /// Absorbs a flake if it crossed the pile's surface from above at an uncovered column.
     func catchFlake(atX x: CGFloat, fromY previousY: CGFloat, toY currentY: CGFloat, depositAmount: CGFloat) -> Bool {
+        // Quick rejects: the flake must be crossing the band where this pile's surface can be.
+        guard previousY >= edgeY, currentY < edgeY + Self.maximumHeight else { return false }
         guard let column = nearestColumn(toX: x), visibleColumns[column] else { return false }
 
         let surfaceY = edgeY + heights[column]
@@ -170,6 +182,7 @@ final class SnowPile {
         }
         settle(around: centerColumn)
         needsRedraw = true
+        hasSnow = true
     }
 
     /// Smooths the pile by moving snow from tall columns to shorter neighbors when the slope is too steep.
@@ -252,6 +265,7 @@ final class SnowPile {
     func redrawIfNeeded() -> Bool {
         guard needsRedraw else { return false }
         needsRedraw = false
+        hasSnow = heights.contains { $0 > Self.bareHeight }
 
         let pilePath = makePilePath()
         fillNode.path = pilePath

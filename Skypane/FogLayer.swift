@@ -37,13 +37,16 @@ final class FogLayer {
 
     private var sceneSize: CGSize = .zero
     private var currentAlpha: CGFloat = 0
+    /// Whether any wiped patch is still filling back in, and the fog opacity the grid was last drawn at.
+    private var hasWipedPatches = false
+    private var gridAlpha: CGFloat = -1
     /// Kept so a rebuilt grid gets the same tint.
     private var fogColor: NSColor?
 
     /// Whether any fog is showing.
     var isVisible: Bool { currentAlpha > 0.005 }
 
-    init() {
+    private func preparePuffs() {
         for _ in 0..<driftingPuffCount {
             let puffSprite = SKSpriteNode(texture: WeatherTextures.fogPuff)
             containerNode.addChild(puffSprite)
@@ -57,12 +60,15 @@ final class FogLayer {
     /// Scatters the drifting puffs and rebuilds the grid for a new scene size.
     func layOut(sceneSize: CGSize) {
         self.sceneSize = sceneSize
+        guard !driftingPuffs.isEmpty else { return }
 
         for puffSprite in driftingPuffs {
             puffSprite.size = CGSize(
                 width: sceneSize.width * CGFloat.random(in: 0.5...0.9),
                 height: sceneSize.height * CGFloat.random(in: 0.25...0.45)
             )
+            puffSprite.color = fogColor ?? .white
+            puffSprite.colorBlendFactor = fogColor == nil ? 0 : 1
             puffSprite.position = CGPoint(
                 x: CGFloat.random(in: 0...max(sceneSize.width, 1)),
                 y: CGFloat.random(in: 0...max(sceneSize.height, 1))
@@ -77,6 +83,7 @@ final class FogLayer {
         gridBlobAlphaFactors.removeAll()
         gridDensities.removeAll()
 
+        gridAlpha = -1
         gridColumnCount = Int((sceneSize.width / gridSpacing).rounded(.up)) + 1
         gridRowCount = Int((sceneSize.height / gridSpacing).rounded(.up)) + 1
         for row in 0..<gridRowCount {
@@ -103,8 +110,32 @@ final class FogLayer {
     /// Fades toward `targetAlpha`, drifts the puffs with the wind, and refills wiped patches.
     func update(deltaTime: CGFloat, easing: CGFloat, targetAlpha: CGFloat, windDrift: CGFloat) {
         currentAlpha += (targetAlpha - currentAlpha) * easing
+        // Finish the fade exactly instead of creeping toward it forever.
+        if abs(targetAlpha - currentAlpha) < 0.0005 {
+            currentAlpha = targetAlpha
+        }
         containerNode.isHidden = !isVisible
-        guard isVisible else { return }
+        guard isVisible else {
+            if targetAlpha == 0, !driftingPuffs.isEmpty {
+                containerNode.removeAllChildren()
+                driftingPuffs.removeAll()
+                driftingPuffSpeeds.removeAll()
+                driftingPuffAlphaFactors.removeAll()
+                gridBlobs.removeAll()
+                gridBlobAlphaFactors.removeAll()
+                gridDensities.removeAll()
+                gridColumnCount = 0
+                gridRowCount = 0
+                hasWipedPatches = false
+                gridAlpha = -1
+            }
+            return
+        }
+        if driftingPuffs.isEmpty {
+            preparePuffs()
+            layOut(sceneSize: sceneSize)
+            containerNode.isHidden = false
+        }
 
         // Drifting puffs move with the wind and wrap around the screen edges.
         let driftDirection: CGFloat = windDrift >= 0 ? 1 : -1
@@ -122,12 +153,26 @@ final class FogLayer {
             }
         }
 
-        // Grid blobs slowly fill back in after being wiped.
+        // Grid blobs slowly fill back in after being wiped. Once every patch is full and the fog
+        // has finished fading, nothing changes, so the grid is left alone.
+        let isFading = abs(targetAlpha - currentAlpha) > 0.0005
+        guard isFading || hasWipedPatches || gridAlpha != currentAlpha else { return }
+
         let refillAmount = refillRate * deltaTime
+        var stillRefilling = false
         for index in gridBlobs.indices {
-            gridDensities[index] = min(gridDensities[index] + refillAmount, 1)
-            gridBlobs[index].alpha = currentAlpha * gridBlobShare * gridDensities[index] * gridBlobAlphaFactors[index]
+            if gridDensities[index] < 1 {
+                gridDensities[index] = min(gridDensities[index] + refillAmount, 1)
+                stillRefilling = stillRefilling || gridDensities[index] < 1
+            }
+            let blobAlpha = currentAlpha * gridBlobShare * gridDensities[index] * gridBlobAlphaFactors[index]
+            // Setting the same alpha still costs work, so only changed blobs are touched.
+            if abs(gridBlobs[index].alpha - blobAlpha) > 0.001 {
+                gridBlobs[index].alpha = blobAlpha
+            }
         }
+        hasWipedPatches = stillRefilling
+        gridAlpha = currentAlpha
     }
 
     /// Tints every fog sprite, or returns them to plain white fog when `color` is nil.
@@ -157,7 +202,10 @@ final class FogLayer {
                     let remainingDensity = min(max((distance - wipeRadius * 0.4) / (wipeRadius * 0.6), 0), 1)
 
                     let index = row * gridColumnCount + column
-                    gridDensities[index] = min(gridDensities[index], remainingDensity)
+                    if remainingDensity < gridDensities[index] {
+                        gridDensities[index] = remainingDensity
+                        hasWipedPatches = true
+                    }
                 }
             }
         }

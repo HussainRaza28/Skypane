@@ -8,7 +8,7 @@ import CoreGraphics
 import os
 
 /// A normal app window as reported by the window server.
-struct TrackedWindow {
+struct TrackedWindow: Equatable {
     let windowNumber: Int
     let ownerProcessID: pid_t
     /// Bounds in CoreGraphics global coordinates (top-left origin of the primary display, y pointing down).

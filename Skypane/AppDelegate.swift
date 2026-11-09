@@ -79,12 +79,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     /// Whether a typed description is being turned into weather.
     @Published private(set) var isDescribingWeather = false
 
-    /// How often app window positions are re-read: often while snow or rain can land or snow is
-    /// piled up, and less often otherwise (still enough to notice full-screen apps).
-    private let fastWindowPollingInterval: Duration = .milliseconds(100)
-    private let slowWindowPollingInterval: Duration = .milliseconds(500)
-    /// Whether the weather on screen right now has snow or rain falling.
-    private var isPrecipitationShowing = true
+    /// How often app window positions are re-read: quickly while snow can land or is piled up
+    /// (so piles follow windows), relaxed while other weather shows (to notice full-screen apps),
+    /// and rarely when nothing is showing. Space and app switches trigger an immediate check.
+    private let pileTrackingInterval: Duration = .milliseconds(100)
+    private let effectsShowingInterval: Duration = .seconds(1)
+    private let nothingShowingInterval: Duration = .seconds(5)
+    /// What the weather on screen right now needs from window tracking.
+    private var isSnowFalling = false
+    private var isPrecipitationShowing = false
+    private var isAnythingShowing = false
+    /// The last window list and Dock frame sent to the screens, so unchanged ones are skipped.
+    private var lastTrackedWindows: [TrackedWindow]?
+    private var lastSentDockFrame: CGRect?
     /// How often the sky tint is recalculated.
     private let skyTintInterval: Duration = .seconds(60)
     /// How often live weather is refreshed, and how soon to retry after a failure.
@@ -96,9 +103,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 
     private let windowTracker = WindowTracker()
     private let dockEstimator = DockEstimator()
-    private let dockEstimateInterval: TimeInterval = 1
+    /// The Dock's size is recalculated only when something could have changed it (apps opening
+    /// or quitting, Space switches, windows appearing or disappearing), plus a slow safety check.
+    private let dockSafetyRefreshInterval: TimeInterval = 30
     private var estimatedDockFrame: CGRect?
-    private var nextDockEstimate = Date.distantPast
+    private var isDockEstimateStale = true
+    private var nextDockSafetyRefresh = Date.distantPast
     private let locationProvider = LocationProvider()
     private let weatherClient = OpenMeteoClient()
     private let firstSnowNotifier = FirstSnowNotifier()
@@ -114,12 +124,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         quitOtherCopies()
+        // Benchmark mode picks its fixed scene before anything is drawn, so no other weather shows first.
+        let isBenchmarking = startBenchmarkIfRequested()
         screenOverlays = NSScreen.screens.map { ScreenOverlay(screen: $0) }
         applyPreferences()
         observeSystemChanges()
         updatePowerState()
         startWindowPolling()
-        startWeatherUpdates()
+        if isBenchmarking, let reportPath = UserDefaults.standard.string(forKey: "SkypaneBenchmarkReport") {
+            Task { [weak self] in
+                for delay in [20, 32] {
+                    try? await Task.sleep(for: .seconds(delay))
+                    guard let self else { return }
+                    let report: [String: Any] = [
+                        "source": String(describing: self.weatherSource),
+                        "designing": self.isDescribingWeather,
+                        "paused": self.isPaused,
+                        "powerPaused": self.isPausedForPower,
+                        "screens": self.screenOverlays.map { $0.benchmarkState }
+                    ]
+                    if let data = try? JSONSerialization.data(withJSONObject: report, options: [.sortedKeys]) {
+                        try? data.write(to: URL(fileURLWithPath: reportPath), options: .atomic)
+                    }
+                }
+            }
+        }
+
+        // Benchmark mode skips live weather (no location or network).
+        if !isBenchmarking {
+            startWeatherUpdates()
+        }
+    }
+
+    // MARK: - Benchmark mode
+
+    /// Hidden launch arguments for measuring performance with a fixed scene, without typing:
+    /// `-SkypaneBenchmarkScene clear|lightSnow|heavySnow|rain|thunderstorm|fog|leaves|fireflies`
+    /// or `-SkypaneBenchmarkCustom "<description>"`. Returns true if one was given.
+    private func startBenchmarkIfRequested() -> Bool {
+        let launchSettings = UserDefaults.standard
+        if let sceneName = launchSettings.string(forKey: "SkypaneBenchmarkScene") {
+            let preview = sceneName == "leaves" ? .autumnLeaves : WeatherPreview(rawValue: sceneName)
+            if let preview {
+                weatherSource = .preview(preview)
+            } else {
+                logger.error("Unknown benchmark scene: \(sceneName, privacy: .public)")
+            }
+            return true
+        }
+        if let customDescription = launchSettings.string(forKey: "SkypaneBenchmarkCustom") {
+            // A clear sky while the scene is being designed.
+            weatherSource = .preview(.clear)
+            Task { await showDescribedWeather(customDescription, mode: .newScene) }
+            return true
+        }
+        return false
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -161,6 +220,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         ) { [weak self] _ in
             MainActor.assumeIsolated { self?.rebuildOverlays() }
         })
+
+        // Apps opening or quitting change the Dock; switching Spaces or apps can show a
+        // full-screen app. Check right away instead of waiting for the next window check.
+        let workspaceNotifications: [Notification.Name] = [
+            NSWorkspace.didLaunchApplicationNotification,
+            NSWorkspace.didTerminateApplicationNotification,
+            NSWorkspace.activeSpaceDidChangeNotification,
+            NSWorkspace.didActivateApplicationNotification,
+        ]
+        for notificationName in workspaceNotifications {
+            systemObservers.append(NSWorkspace.shared.notificationCenter.addObserver(
+                forName: notificationName, object: nil, queue: .main
+            ) { [weak self] notification in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    if notification.name != NSWorkspace.didActivateApplicationNotification {
+                        self.isDockEstimateStale = true
+                    }
+                    self.refreshTrackedWindows()
+                }
+            })
+        }
     }
 
     /// Pauses effects in Low Power Mode or on a low battery, if that setting is on.
@@ -172,7 +253,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             screenOverlay.setPausedForPower(shouldPause)
         }
         if !shouldPause {
-            refreshTrackedWindows()
+            refreshTrackedWindows(force: true)
         }
     }
 
@@ -209,7 +290,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         updatePowerState()
         applyWeatherEffect()
         applySkyTint()
-        refreshTrackedWindows()
+        refreshTrackedWindows(force: true)
     }
 
     /// Turns "open at login" on or off with the system.
@@ -426,7 +507,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         case .live: liveEffect
         }
         let effect = adjustedForSettings(selectedEffect, isLive: weatherSource == .live)
-        isPrecipitationShowing = effect.snowIntensity > 0 || effect.rainIntensity > 0
+        isSnowFalling = effect.snowIntensity > 0
+        isPrecipitationShowing = isSnowFalling || effect.rainIntensity > 0
+        isAnythingShowing = isPrecipitationShowing || effect.fogAmount > 0 || effect.hasLightning
+            || !effect.ambientLayers.isEmpty || !effect.customLayers.isEmpty
         for screenOverlay in screenOverlays {
             screenOverlay.apply(effect)
         }
@@ -451,35 +535,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 
     // MARK: - Window tracking
 
-    /// Re-reads app window positions about ten times a second so piles follow the windows.
+    /// Re-reads app window positions as often as the weather on screen needs.
     private func startWindowPolling() {
         windowPollingTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
                 self.refreshTrackedWindows()
-                let needsFastTracking = self.isPrecipitationShowing || self.screenOverlays.contains { $0.hasPiledSnow }
-                try? await Task.sleep(for: needsFastTracking ? self.fastWindowPollingInterval : self.slowWindowPollingInterval)
+                try? await Task.sleep(for: self.windowPollingInterval)
             }
         }
     }
 
-    private func refreshTrackedWindows() {
+    private var windowPollingInterval: Duration {
+        let hasPiledSnow = screenOverlays.contains { $0.hasPiledSnow }
+        if isSnowFalling || hasPiledSnow {
+            return pileTrackingInterval
+        }
+        return isAnythingShowing ? effectsShowingInterval : nothingShowingInterval
+    }
+
+    /// Sends the current window list and Dock frame to every screen. Skips the screens' work when
+    /// nothing changed, unless `force` is set (after settings change or a pause ends).
+    private func refreshTrackedWindows(force: Bool = false) {
         guard !isPaused, !isPausedForPower else { return }
 
-        // The Dock changes rarely, so its estimate is refreshed about once a second.
-        if Date.now >= nextDockEstimate {
-            let canMeasureDock = dockEstimator.canMeasureDockExactly
-            if canMeasureDock != isDockFitExact {
-                isDockFitExact = canMeasureDock
-            }
-            estimatedDockFrame = dockEstimator.estimatedDockFrame()
-            nextDockEstimate = Date.now.addingTimeInterval(dockEstimateInterval)
+        let trackedWindows = windowTracker.currentWindows()
+
+        // Windows appearing or disappearing (including minimizing to the Dock) can change the Dock's size.
+        if let lastTrackedWindows, lastTrackedWindows.map(\.windowNumber) != trackedWindows.map(\.windowNumber) {
+            isDockEstimateStale = true
+        }
+        refreshDockFrameIfNeeded()
+
+        // The pile layer sleeps while piles sit still; wake it if the cursor is about to brush one.
+        let cursorLocation = NSEvent.mouseLocation
+        for screenOverlay in screenOverlays where screenOverlay.hasPiledSnow {
+            screenOverlay.wakeIfCursorIsNearPiles(globalCursorLocation: cursorLocation)
         }
 
-        let trackedWindows = windowTracker.currentWindows()
+        guard force || trackedWindows != lastTrackedWindows || estimatedDockFrame != lastSentDockFrame else { return }
+        lastTrackedWindows = trackedWindows
+        lastSentDockFrame = estimatedDockFrame
+
         // The primary screen (with the menu bar) defines the CoreGraphics coordinate origin.
         let primaryScreenHeight = NSScreen.screens.first?.frame.height ?? 0
-
         for screenOverlay in screenOverlays {
             screenOverlay.updateTrackedWindows(
                 trackedWindows,
@@ -487,6 +586,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
                 primaryScreenHeight: primaryScreenHeight
             )
         }
+    }
+
+    /// Recalculates the Dock's frame when it may have changed, but only while Dock effects can show.
+    private func refreshDockFrameIfNeeded() {
+        if Date.now >= nextDockSafetyRefresh {
+            isDockEstimateStale = true
+            nextDockSafetyRefresh = Date.now.addingTimeInterval(dockSafetyRefreshInterval)
+            // Also notice Accessibility being granted, which switches to an exact Dock fit.
+            let canMeasureDock = dockEstimator.canMeasureDockExactly
+            if canMeasureDock != isDockFitExact {
+                isDockFitExact = canMeasureDock
+            }
+        }
+
+        let dockEffectsCanShow = preferences.showsDockEffects
+            && (isPrecipitationShowing || screenOverlays.contains { $0.hasPiledSnow })
+        guard isDockEstimateStale, dockEffectsCanShow else { return }
+        estimatedDockFrame = dockEstimator.estimatedDockFrame()
+        isDockEstimateStale = false
     }
 
     // MARK: - Pausing
@@ -497,7 +615,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             screenOverlay.setPaused(isPaused)
         }
         if !isPaused {
-            refreshTrackedWindows()
+            refreshTrackedWindows(force: true)
         }
     }
 }

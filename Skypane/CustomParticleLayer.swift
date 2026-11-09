@@ -54,21 +54,15 @@ final class CustomParticleLayer {
 
     private var slots: [Slot] = []
     private var sceneSize: CGSize = .zero
-    /// Emoji textures, made once per emoji and color treatment.
-    private var textureCache: [String: SKTexture] = [:]
-    private let imageContext = CIContext()
+    /// Emoji textures, made once per emoji and color treatment and shared by every screen.
+    private static let textureCache = NSMapTable<NSString, SKTexture>.strongToWeakObjects()
+    private static let imageContext = CIContext()
 
     init() {
         for _ in 0..<Self.maximumLayerCount {
-            let slot = Slot(capacity: spritesPerLayer)
+            let slot = Slot(capacity: 0)
             slot.containerNode.isHidden = true
             containerNode.addChild(slot.containerNode)
-            for _ in 0..<spritesPerLayer {
-                let sprite = SKSpriteNode()
-                sprite.isHidden = true
-                slot.containerNode.addChild(sprite)
-                slot.sprites.append(sprite)
-            }
             slots.append(slot)
         }
     }
@@ -136,7 +130,19 @@ final class CustomParticleLayer {
         }
         guard let layer else {
             slot.targetCount = 0
+            slot.containerNode.removeAllChildren()
+            slot.sprites.removeAll()
+            slot.particles.removeAll()
             return
+        }
+        if slot.sprites.isEmpty {
+            slot.particles = Array(repeating: Particle(), count: spritesPerLayer)
+            for _ in 0..<spritesPerLayer {
+                let sprite = SKSpriteNode()
+                sprite.isHidden = true
+                slot.containerNode.addChild(sprite)
+                slot.sprites.append(sprite)
+            }
         }
 
         // Bigger emoji need fewer to fill the screen.
@@ -317,7 +323,7 @@ final class CustomParticleLayer {
     /// so tinting keeps the emoji's shading (a pink dragon still looks like a dragon).
     private func emojiTexture(for emoji: String, recolored: Bool) -> SKTexture {
         let cacheKey = "\(emoji)|\(recolored)"
-        if let cachedTexture = textureCache[cacheKey] {
+        if let cachedTexture = Self.textureCache.object(forKey: cacheKey as NSString) {
             return cachedTexture
         }
 
@@ -335,7 +341,7 @@ final class CustomParticleLayer {
            let grayscaleImage = lightGrayscale(emojiCGImage) {
             texture = SKTexture(cgImage: grayscaleImage)
         }
-        textureCache[cacheKey] = texture
+        Self.textureCache.setObject(texture, forKey: cacheKey as NSString)
         return texture
     }
 
@@ -347,7 +353,7 @@ final class CustomParticleLayer {
         colorControls?.setValue(0.25, forKey: kCIInputBrightnessKey)
         colorControls?.setValue(1.1, forKey: kCIInputContrastKey)
         guard let outputImage = colorControls?.outputImage else { return nil }
-        return imageContext.createCGImage(outputImage, from: outputImage.extent)
+        return Self.imageContext.createCGImage(outputImage, from: outputImage.extent)
     }
 }
 

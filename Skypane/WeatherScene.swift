@@ -109,17 +109,28 @@ final class WeatherScene: SKScene {
         didSet { cursorMotion = CursorMotion() }
     }
 
-    /// Frame rates while something is moving, and while only the still tint is showing.
-    private let activeFramesPerSecond = 60
+    /// Frame rates: full speed for quick moments (a lightning flash, wiping fog), a steady rate
+    /// for falling weather (smooth at these speeds, half the work), and slow while nothing moves.
+    private let interactiveFramesPerSecond = 60
+    private let fallingFramesPerSecond = 30
     private let idleFramesPerSecond = 10
     /// After this long with nothing changing, the layer stops drawing until something new arrives.
-    private let sleepAfterIdleDuration: CGFloat = 2
+    private let sleepAfterIdleDuration: CGFloat = 0.5
     private var idleDuration: CGFloat = 0
+    /// How long full speed lasts after the cursor wipes fog.
+    private let interactionHoldDuration: CGFloat = 0.5
+    private var timeSinceLastInteraction: CGFloat = .greatestFiniteMagnitude
+    /// Tint changes smaller than this (like the minute-by-minute change at dusk) apply at once,
+    /// so they don't keep the layer awake for a fade nobody can see.
+    private let unnoticeableTintChange: CGFloat = 0.03
+
+    /// The screen fills with already-falling weather the first time there is some to show.
+    private var needsPrefill = true
 
     /// Whether this screen's overlay is showing. The layer only wakes itself while it is.
     var allowsDrawing = true
 
-    private var effect = WeatherEffect.fallbackSnow
+    private var effect = WeatherEffect()
     private var targetSkyTint = SkyTint.none
 
     private var particles: [Particle] = []
@@ -185,9 +196,17 @@ final class WeatherScene: SKScene {
             particleSprites.append(particleSprite)
         }
 
-        // Start with particles already spread over the screen so it's already snowing or raining.
         currentWindDrift = effect.windDrift
         updateTargetParticleCount()
+        prefillIfNeeded()
+    }
+
+    /// Spreads the first weather over the whole screen so it's already snowing or raining,
+    /// instead of starting with an empty sky.
+    private func prefillIfNeeded() {
+        guard needsPrefill, !particleSprites.isEmpty, targetParticleCount > 0 else { return }
+        needsPrefill = false
+        currentWindDrift = effect.windDrift
         for index in 0..<targetParticleCount {
             spawnParticle(at: index, anywhereOnScreen: true)
         }
@@ -207,6 +226,8 @@ final class WeatherScene: SKScene {
 
     /// Switches to new weather. Falling particles finish their fall; new ones use the new weather.
     func apply(_ newEffect: WeatherEffect) {
+        // The same weather is re-sent every minute; only real changes need work.
+        guard newEffect != effect else { return }
         effect = newEffect
         wake()
         fogLayer.setColor(newEffect.fogColor)
@@ -214,11 +235,21 @@ final class WeatherScene: SKScene {
         ambientLayer.apply(newEffect.ambientLayers)
         customLayer.apply(newEffect.customLayers)
         updateTargetParticleCount()
+        prefillIfNeeded()
     }
 
-    /// Sets the color wash over the desktop (night darkening, or a typed scene's mood color). It fades in gradually.
+    /// Sets the color wash over the desktop (night darkening, or a typed scene's mood color).
+    /// Big changes fade in gradually; tiny ones (dusk deepening minute by minute) apply at once.
     func apply(_ skyTint: SkyTint) {
+        guard skyTint != targetSkyTint else { return }
+        let isSameColor = skyTint.color == targetSkyTint.color
         targetSkyTint = skyTint
+
+        let targetAlpha = skyTint.strength * maximumSkyTintAlpha
+        if isSameColor, abs(targetAlpha - nightTintNode.alpha) < unnoticeableTintChange {
+            nightTintNode.alpha = targetAlpha
+            nightTintNode.isHidden = targetAlpha < 0.005
+        }
         wake()
     }
 
@@ -258,8 +289,16 @@ final class WeatherScene: SKScene {
             windDrift: currentWindDrift
         )
         // The cursor wipes fog wherever it passes.
-        if cursorInteracts, let cursorMovement = cursorMotion.update(screenOrigin: screenOrigin, deltaTime: deltaTime) {
+        timeSinceLastInteraction += deltaTime
+        if cursorInteracts, fogLayer.isVisible,
+           let cursorMovement = cursorMotion.update(screenOrigin: screenOrigin, deltaTime: deltaTime) {
             fogLayer.wipe(along: cursorMovement)
+            if cursorMovement.speed > 1 {
+                timeSinceLastInteraction = 0
+            }
+        } else if !fogLayer.isVisible {
+            // Start fresh when fog appears, so the first wipe doesn't jump from an old position.
+            cursorMotion = CursorMotion()
         }
 
         updateLightning(deltaTime: deltaTime)
@@ -267,8 +306,8 @@ final class WeatherScene: SKScene {
         updateFrameRate(deltaTime: deltaTime)
     }
 
-    /// Draws at full speed while anything moves, slowly when the layer is empty, and not at all
-    /// once nothing has changed for a couple of seconds, to save power.
+    /// Picks the frame rate for what's happening, and stops drawing once nothing has changed for
+    /// a moment, to save power.
     private func updateFrameRate(deltaTime: CGFloat) {
         let isIdle = targetParticleCount == 0
             && !particles.contains(where: \.isActive)
@@ -277,7 +316,14 @@ final class WeatherScene: SKScene {
             && !customLayer.isShowingAnything
             && lightningFlashElapsed == nil
             && !effect.hasLightning
-        let framesPerSecond = isIdle ? idleFramesPerSecond : activeFramesPerSecond
+        let isInteracting = lightningFlashElapsed != nil || timeSinceLastInteraction < interactionHoldDuration
+        let framesPerSecond = if isInteracting {
+            interactiveFramesPerSecond
+        } else if isIdle {
+            idleFramesPerSecond
+        } else {
+            fallingFramesPerSecond
+        }
         if let view, view.preferredFramesPerSecond != framesPerSecond {
             view.preferredFramesPerSecond = framesPerSecond
         }

@@ -4,6 +4,7 @@
 //
 
 import AppKit
+import QuartzCore
 import SpriteKit
 
 /// The two click-through overlay windows covering one screen:
@@ -53,6 +54,12 @@ final class ScreenOverlay {
         frontView.presentScene(pileScene)
         backWindow.contentView = backView
         frontWindow.contentView = frontView
+
+        // Each full-screen frame takes about 24 MB on a Retina screen. Two in flight is plenty at
+        // these frame rates, and saves a frame's worth of memory per layer.
+        for spriteView in [backView, frontView] {
+            (spriteView.layer as? CAMetalLayer)?.maximumDrawableCount = 2
+        }
 
         backWindow.orderFrontRegardless()
         frontWindow.orderFrontRegardless()
@@ -175,6 +182,12 @@ final class ScreenOverlay {
     /// Whether any window or the Dock on this screen has snow resting on it.
     var hasPiledSnow: Bool { pileScene.hasPiledSnow }
 
+    /// Lets the sleeping pile layer know the cursor moved, so it can wake before a brush.
+    func wakeIfCursorIsNearPiles(globalCursorLocation: CGPoint) {
+        guard isShowingOverlays else { return }
+        pileScene.wakeIfCursorIsNearPiles(globalCursorLocation: globalCursorLocation)
+    }
+
     /// Removes both windows, for when this screen goes away or the screens are rearranged.
     func close() {
         weatherScene.allowsDrawing = false
@@ -183,6 +196,17 @@ final class ScreenOverlay {
         frontView.isPaused = true
         backWindow.close()
         frontWindow.close()
+    }
+
+    /// Snapshot for benchmark validation; hidden or paused overlays must not count as active weather.
+    var benchmarkState: [String: Any] {
+        [
+            "visible": isShowingOverlays,
+            "weatherPaused": backView.isPaused,
+            "pilesPaused": frontView.isPaused,
+            "weatherFPS": backView.preferredFramesPerSecond,
+            "pilesFPS": frontView.preferredFramesPerSecond
+        ]
     }
 
     // MARK: - Setup helpers

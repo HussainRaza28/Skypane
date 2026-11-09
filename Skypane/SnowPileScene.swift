@@ -28,8 +28,12 @@ final class SnowPileScene: SKScene, PrecipitationSurface, LightningObserver {
     private let maximumChunkCount = 400
     /// Downward acceleration for falling chunks, in points per second squared.
     private let chunkGravity: CGFloat = 900
-    /// How often changed piles are redrawn, so path rebuilding stays cheap.
-    private let pileRedrawInterval: CGFloat = 1.0 / 20.0
+    /// How often changed piles are redrawn, so path rebuilding stays cheap. Piles grow slowly,
+    /// so this is plenty.
+    private let pileRedrawInterval: CGFloat = 1.0 / 10.0
+    /// Melting is slow, so it's applied in one-second steps instead of every frame.
+    private let meltStepInterval: CGFloat = 1
+    private var timeSinceLastMeltStep: CGFloat = 0
     /// Frames within this distance count as unchanged, to ignore rounding noise.
     private let frameChangeTolerance: CGFloat = 0.5
     /// Largest simulation step, so a pause or hitch doesn't teleport chunks.
@@ -49,7 +53,9 @@ final class SnowPileScene: SKScene, PrecipitationSurface, LightningObserver {
 
     /// Whether piles should slowly melt. Set from the current weather.
     var isMelting = false {
-        didSet { wake() }
+        didSet {
+            if isMelting != oldValue { wake() }
+        }
     }
     /// This screen's bottom-left corner in global coordinates, for converting the cursor position.
     var screenOrigin: CGPoint = .zero
@@ -61,14 +67,20 @@ final class SnowPileScene: SKScene, PrecipitationSurface, LightningObserver {
         }
     }
 
-    /// Frame rates while something moves, and while the piles just sit there.
-    private let activeFramesPerSecond = 60
-    private let idleFramesPerSecond = 15
-    /// How long to keep full speed after the last movement, and how long until drawing stops
+    /// Frame rates: full speed while chunks fly or lightning glows, a steady rate while ripples
+    /// spread, piles change, or the cursor is near a pile, and a trickle while piles only melt.
+    private let interactiveFramesPerSecond = 60
+    private let steadyFramesPerSecond = 30
+    private let pileFramesPerSecond = 10
+    private let meltingFramesPerSecond = 5
+    /// How long a rate is kept after the thing that needed it, and how long until drawing stops
     /// entirely when nothing can change.
     private let activityHoldDuration: CGFloat = 1
-    private let sleepAfterIdleDuration: CGFloat = 3
-    private var timeSinceLastActivity: CGFloat = 0
+    private let sleepAfterIdleDuration: CGFloat = 0.5
+    /// How close (in points) the cursor has to be to a pile to keep the layer ready for brushing.
+    private let cursorWakeDistance: CGFloat = 60
+    private var timeSinceInteractiveActivity: CGFloat = .greatestFiniteMagnitude
+    private var timeSinceSteadyActivity: CGFloat = .greatestFiniteMagnitude
 
     /// Whether this screen's overlay is showing. The layer only wakes itself while it is.
     var allowsDrawing = true
@@ -303,6 +315,7 @@ final class SnowPileScene: SKScene, PrecipitationSurface, LightningObserver {
         edgeLightning.setBrightness(brightness)
         if brightness > 0 {
             wake()
+            view?.preferredFramesPerSecond = interactiveFramesPerSecond
         }
     }
 
@@ -313,9 +326,10 @@ final class SnowPileScene: SKScene, PrecipitationSurface, LightningObserver {
 
     /// Resumes drawing after the layer went to sleep.
     func wake() {
-        timeSinceLastActivity = 0
+        timeSinceSteadyActivity = 0
         guard allowsDrawing, let view, view.isPaused else { return }
         lastUpdateTime = nil
+        view.preferredFramesPerSecond = steadyFramesPerSecond
         view.isPaused = false
     }
 
@@ -361,6 +375,7 @@ final class SnowPileScene: SKScene, PrecipitationSurface, LightningObserver {
         isChunkActive[index] = true
         activeChunkCount += 1
         wake()
+        view?.preferredFramesPerSecond = interactiveFramesPerSecond
 
         let chunkSprite = chunkSprites[index]
         chunkSprite.size = CGSize(width: diameter, height: diameter)
@@ -372,11 +387,18 @@ final class SnowPileScene: SKScene, PrecipitationSurface, LightningObserver {
     // MARK: - Per-frame update
 
     override func update(_ currentTime: TimeInterval) {
-        let deltaTime = CGFloat(min(currentTime - (lastUpdateTime ?? currentTime), maximumTimeStep))
+        // Slow pile-only frames still account for real elapsed time. Moving effects keep
+        // their smaller physics step so a hitch cannot teleport chunks or ripples.
+        let elapsedTime = CGFloat(min(currentTime - (lastUpdateTime ?? currentTime), 0.25))
+        let deltaTime = min(elapsedTime, CGFloat(maximumTimeStep))
         lastUpdateTime = currentTime
-        guard deltaTime > 0 else { return }
+        guard elapsedTime > 0 else { return }
 
-        if cursorInteracts, let cursorMovement = cursorMotion.update(screenOrigin: screenOrigin, deltaTime: deltaTime) {
+        if cursorInteracts, let cursorMovement = cursorMotion.update(screenOrigin: screenOrigin, deltaTime: elapsedTime) {
+            if isNearPiles(cursorMovement.end) {
+                timeSinceSteadyActivity = 0
+                timeSinceInteractiveActivity = 0
+            }
             brushSnow(with: cursorMovement)
         }
 
@@ -384,42 +406,81 @@ final class SnowPileScene: SKScene, PrecipitationSurface, LightningObserver {
             updateChunks(deltaTime: deltaTime)
         }
 
-        if isMelting {
-            for pile in orderedPiles {
-                pile.melt(by: meltRate * deltaTime)
+        if isMelting, hasPiledSnow {
+            timeSinceLastMeltStep += elapsedTime
+            if timeSinceLastMeltStep >= meltStepInterval {
+                for pile in orderedPiles where pile.hasSnow {
+                    pile.melt(by: meltRate * timeSinceLastMeltStep)
+                }
+                timeSinceLastMeltStep = 0
             }
         }
 
         dockRipples.update(deltaTime: deltaTime)
 
         // Redraw changed piles a few times a second rather than on every landing.
-        timeSinceLastPileRedraw += deltaTime
-        if timeSinceLastPileRedraw >= pileRedrawInterval {
+        timeSinceLastPileRedraw += elapsedTime
+        if timeSinceLastPileRedraw >= pileRedrawInterval - 0.001 {
             timeSinceLastPileRedraw = 0
             var didRedraw = false
             for pile in orderedPiles where pile.redrawIfNeeded() {
                 didRedraw = true
             }
             if didRedraw {
-                timeSinceLastActivity = 0
+                timeSinceSteadyActivity = 0
             }
         }
-        updateFrameRate(deltaTime: deltaTime)
+        updateFrameRate(deltaTime: elapsedTime)
     }
 
-    /// Draws at full speed while chunks fall, ripples spread, lightning glows, or piles change,
-    /// and slowly while the piles just sit there, to save power.
+    /// Picks the frame rate for what's happening, and stops drawing when nothing can change.
+    /// While asleep, the window check wakes the layer if the cursor comes near a pile.
     private func updateFrameRate(deltaTime: CGFloat) {
-        let isMoving = activeChunkCount > 0 || dockRipples.hasActiveRipples || edgeLightning.isGlowing
-        timeSinceLastActivity = isMoving ? 0 : timeSinceLastActivity + deltaTime
-        let framesPerSecond = timeSinceLastActivity > activityHoldDuration ? idleFramesPerSecond : activeFramesPerSecond
+        timeSinceInteractiveActivity += deltaTime
+        timeSinceSteadyActivity += deltaTime
+        if activeChunkCount > 0 || edgeLightning.isGlowing {
+            timeSinceInteractiveActivity = 0
+        }
+        if dockRipples.hasActiveRipples {
+            timeSinceSteadyActivity = 0
+        }
+        let isMeltingPiles = isMelting && hasPiledSnow
+
+        let framesPerSecond: Int
+        if timeSinceInteractiveActivity < activityHoldDuration {
+            framesPerSecond = interactiveFramesPerSecond
+        } else if dockRipples.hasActiveRipples {
+            framesPerSecond = steadyFramesPerSecond
+        } else if timeSinceSteadyActivity < activityHoldDuration {
+            framesPerSecond = pileFramesPerSecond
+        } else if isMeltingPiles {
+            framesPerSecond = meltingFramesPerSecond
+        } else {
+            framesPerSecond = pileFramesPerSecond
+            if timeSinceSteadyActivity > activityHoldDuration + sleepAfterIdleDuration {
+                view?.isPaused = true
+            }
+        }
         if let view, view.preferredFramesPerSecond != framesPerSecond {
             view.preferredFramesPerSecond = framesPerSecond
         }
+    }
 
-        // Piled snow keeps the layer awake when the cursor can brush it or it's melting.
-        if timeSinceLastActivity > sleepAfterIdleDuration, !(hasPiledSnow && (cursorInteracts || isMelting)) {
-            view?.isPaused = true
+    /// Whether a point (in scene coordinates) is close to any piled snow.
+    func isNearPiles(_ point: CGPoint) -> Bool {
+        orderedPiles.contains { $0.isNear(point, margin: cursorWakeDistance) }
+    }
+
+    /// Wakes the layer if the cursor (in global coordinates) is close to piled snow, so brushing
+    /// works even though the layer sleeps while the piles sit still.
+    func wakeIfCursorIsNearPiles(globalCursorLocation: CGPoint) {
+        guard cursorInteracts, let view else { return }
+        let sceneLocation = CGPoint(x: globalCursorLocation.x - screenOrigin.x, y: globalCursorLocation.y - screenOrigin.y)
+        if isNearPiles(sceneLocation) {
+            wake()
+            view.preferredFramesPerSecond = interactiveFramesPerSecond
+            timeSinceInteractiveActivity = 0
+            timeSinceSteadyActivity = 0
         }
     }
 
